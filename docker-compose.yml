@@ -1,0 +1,26 @@
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: fundora-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: fundora
+      POSTGRES_PASSWORD: fundora_dev_password
+      POSTGRES_DB: fundora_db
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - fundora_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fundora -d fundora_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  fundora_postgres_data:
