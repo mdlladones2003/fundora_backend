@@ -7,7 +7,7 @@ pub enum Role {
     Guest,
     Donor,
     Organizer,
-    Administrator
+    Administrator,
 }
 
 impl Role {
@@ -16,7 +16,7 @@ impl Role {
             Self::Guest => "guest",
             Self::Donor => "donor",
             Self::Organizer => "organizer",
-            Self::Administrator => "administrator"
+            Self::Administrator => "administrator",
         }
     }
 

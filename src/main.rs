@@ -5,25 +5,29 @@ mod database;
 mod error;
 mod routes;
 
-use axum::{http::{HeaderValue,Method},routing::get,Router};
+use axum::{
+    Router,
+    http::{HeaderValue, Method},
+    routing::get,
+};
 use std::net::SocketAddr;
-use tower_http::{cors::CorsLayer,trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
-#[tokio::main]async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt().with_env_filter(
-        std::env::var("RUST_LOG")
-            .unwrap_or_else(|_|"info".into())
-        )
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
-    
+
     let config = config::Config::from_env()?;
     let pool = database::connection::connect(&config.database_url).await?;
-    
+
     sqlx::migrate!("./migrations").run(&pool).await?;
-    
-    let port=config.port;
-    let mut origins: Vec<HeaderValue> = config.frontend_origin
+
+    let port = config.port;
+    let mut origins: Vec<HeaderValue> = config
+        .frontend_origin
         .split(',')
         .filter_map(|origin| origin.trim().parse::<HeaderValue>().ok())
         .collect();
@@ -33,29 +37,37 @@ use tower_http::{cors::CorsLayer,trace::TraceLayer};
     if let Ok(origin) = "http://127.0.0.1:3000".parse::<HeaderValue>() {
         origins.push(origin);
     }
-    let state = app::AppState{pool, config, http:reqwest::Client::new()};
+    let state = app::AppState {
+        pool,
+        config,
+        http: reqwest::Client::new(),
+    };
     let cors = CorsLayer::new()
-                                    .allow_origin(origins)
-                                    .allow_methods([
-                                        Method::GET,
-                                        Method::POST,
-                                        Method::PATCH,
-                                        Method::DELETE,
-                                        Method::OPTIONS])
-                                    .allow_headers([
-                                        axum::http::header::AUTHORIZATION,
-                                        axum::http::header::CONTENT_TYPE
-                                    ]);
+        .allow_origin(origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ]);
     let app = Router::new()
-                            .route("/health",get(||async{axum::Json(serde_json::json!({"status":"ok","service":"fundora"}))}))
-                            .nest("/api/v1",routes::router(state))
-                            .layer(TraceLayer::new_for_http())
-                            .layer(cors);
-    let addr = SocketAddr::from(([0,0,0,0],port));
+        .route(
+            "/health",
+            get(|| async { axum::Json(serde_json::json!({"status":"ok","service":"fundora"})) }),
+        )
+        .nest("/api/v1", routes::router(state))
+        .layer(TraceLayer::new_for_http())
+        .layer(cors);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    
-    tracing::info!("Fundora API listening on {}",addr);
-    axum::serve(listener,app).await?;
-    
+
+    tracing::info!("Fundora API listening on {}", addr);
+    axum::serve(listener, app).await?;
+
     Ok(())
 }

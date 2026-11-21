@@ -1,18 +1,18 @@
-use axum::{extract::State, Json};
+use crate::{
+    app::AppState,
+    auth::{AuthUser, otp, session},
+    database::repositories::user_repository,
+    error::AppError,
+};
+use axum::{Json, extract::State};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
-use crate::{
-    app::AppState,
-    auth::{otp,session},
-    database::repositories::user_repository,
-    error::AppError
-};
 
 #[derive(Deserialize)]
 pub struct EmailRequest {
-    pub email: String
+    pub email: String,
 }
 
 fn is_valid_email(email: &str) -> bool {
@@ -20,7 +20,12 @@ fn is_valid_email(email: &str) -> bool {
         return false;
     }
     match email.split_once('@') {
-        Some((local, domain)) => !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'),
+        Some((local, domain)) => {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+        }
         None => false,
     }
 }
@@ -111,8 +116,8 @@ pub async fn request_email_code(
 
 #[derive(Deserialize)]
 pub struct VerifyEmailRequest {
-    pub email:String,
-    pub code:String
+    pub email: String,
+    pub code: String,
 }
 
 pub async fn verify_email_code(
@@ -197,33 +202,87 @@ pub async fn verify_email_code(
 
 #[derive(Deserialize)]
 pub struct RefreshRequest {
-    pub refresh_token: String
+    pub refresh_token: String,
 }
 
-pub async fn refresh(State(state): State<AppState>, Json(body): Json<RefreshRequest>)
-    -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(session::rotate_session(&state, &body.refresh_token).await?))
+pub async fn refresh(
+    State(state): State<AppState>,
+    Json(body): Json<RefreshRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(
+        session::rotate_session(&state, &body.refresh_token).await?,
+    ))
 }
 
-pub async fn logout(State(state): State<AppState>, Json(body): Json<RefreshRequest>)
-    -> Result<Json<serde_json::Value>, AppError> {
+pub async fn logout(
+    State(state): State<AppState>,
+    Json(body): Json<RefreshRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
     session::revoke_session(&state, &body.refresh_token).await?;
     Ok(Json(json!({"message":"Session revoked"})))
 }
 
 pub async fn me(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<crate::auth::jwt::Claims>,
+    axum::Extension(user): axum::Extension<AuthUser>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user = user_repository::get(&state.pool, claims.sub)
+    let profile = user_repository::get(&state.pool, user.id)
         .await?
         .ok_or(AppError::Unauthorized)?;
     Ok(Json(json!({
-        "id": user.id,
-        "email": user.email,
-        "display_name": user.display_name,
-        "avatar_url": user.avatar_url,
-        "wallet_address": user.wallet_address,
-        "created_at": user.created_at
+        "id": profile.id,
+        "email": profile.email,
+        "display_name": profile.display_name,
+        "avatar_url": profile.avatar_url,
+        "wallet_address": profile.wallet_address,
+        "role": user.role,
+        "is_active": profile.is_active,
+        "created_at": profile.created_at
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateProfile {
+    pub display_name: String,
+    pub avatar_url: Option<String>,
+}
+
+pub async fn update_me(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<AuthUser>,
+    Json(body): Json<UpdateProfile>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let display_name = body.display_name.trim();
+    let avatar_url = body.avatar_url.map(|url| url.trim().to_owned());
+    if display_name.is_empty() || display_name.len() > 120 {
+        return Err(AppError::BadRequest(
+            "Display name must be between 1 and 120 characters".into(),
+        ));
+    }
+    if avatar_url.as_ref().is_some_and(|url| url.len() > 2048) {
+        return Err(AppError::BadRequest(
+            "Avatar URL must be 2048 characters or fewer".into(),
+        ));
+    }
+
+    let profile = sqlx::query_as::<_, crate::database::models::user::User>(
+        "UPDATE users SET display_name=$2,avatar_url=$3,updated_at=NOW() WHERE id=$1 AND is_active=TRUE RETURNING *",
+    )
+    .bind(user.id)
+    .bind(display_name)
+    .bind(avatar_url)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::Unauthorized)?;
+
+    Ok(Json(json!({
+        "id": profile.id,
+        "email": profile.email,
+        "display_name": profile.display_name,
+        "avatar_url": profile.avatar_url,
+        "wallet_address": profile.wallet_address,
+        "role": user.role,
+        "is_active": profile.is_active,
+        "created_at": profile.created_at
     })))
 }

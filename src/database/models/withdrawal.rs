@@ -13,6 +13,7 @@ pub struct Withdrawal {
     pub destination_address: String,
     pub purpose: String,
     pub status: String,
+    pub review_reason: Option<String>,
     pub reviewed_by: Option<Uuid>,
     pub reviewed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -28,5 +29,6 @@ pub struct CreateWithdrawal {
 
 #[derive(Debug, Deserialize)]
 pub struct ReviewWithdrawal {
-    pub approve: bool
+    pub decision: String,
+    pub reason: Option<String>,
 }

@@ -1,25 +1,43 @@
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("database error")] Db(#[from] sqlx::Error),
-    #[error("unauthorized")] Unauthorized,
-    #[error("forbidden")] Forbidden,
-    #[error("not found")] NotFound,
-    #[error("invalid request: {0}")] BadRequest(String),
-    #[error("internal server error")] Internal,
+    #[error("database error")]
+    Db(#[from] sqlx::Error),
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
+    #[error("not found")]
+    NotFound,
+    #[error("invalid request: {0}")]
+    BadRequest(String),
+    #[error("internal server error")]
+    Internal,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            Self::Db(sqlx::Error::RowNotFound) | Self::NotFound => (StatusCode::NOT_FOUND, "resource not found".to_string()),
+            Self::Db(sqlx::Error::RowNotFound) | Self::NotFound => {
+                (StatusCode::NOT_FOUND, "resource not found".to_string())
+            }
             Self::Db(err) => {
                 tracing::error!(error = %err, "Database operation failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
             }
-            Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string()),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden".into()),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
