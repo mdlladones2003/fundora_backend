@@ -13,6 +13,8 @@ pub enum AppError {
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("not found")]
     NotFound,
     #[error("invalid request: {0}")]
@@ -39,6 +41,7 @@ impl IntoResponse for AppError {
             Self::ServiceUnavailable(message) => {
                 (StatusCode::SERVICE_UNAVAILABLE, message.to_string())
             }
+            Self::Conflict(message) => (StatusCode::CONFLICT, message),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error".to_string(),

@@ -1,31 +1,27 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
-
-#[derive(Debug, Serialize, FromRow)]
-pub struct Donation {
-    pub id: Uuid,
-    pub campaign_id: Uuid,
-    pub donor_id: Option<Uuid>,
-    pub amount: Decimal,
-    pub currency: String,
-    pub status: String,
-    pub is_anonymous: bool,
-    pub message: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub confirmed_at: Option<DateTime<Utc>>,
-}
 
 #[derive(Debug, Serialize, FromRow)]
 pub struct DonationHistory {
     pub id: Uuid,
     pub campaign_id: Uuid,
     pub donor_id: Option<Uuid>,
+    pub donor_wallet_address: Option<String>,
+    pub recipient_wallet_address: Option<String>,
     pub amount: Decimal,
     pub currency: String,
+    pub payment_amount: Option<Decimal>,
+    pub payment_currency: Option<String>,
+    pub exchange_rate: Option<Decimal>,
+    pub exchange_rate_provider: Option<String>,
+    pub exchange_rate_at: Option<DateTime<Utc>>,
     pub status: String,
+    pub payment_method: Option<String>,
+    pub payment_provider: Option<String>,
+    pub payment_reference: Option<String>,
     pub is_anonymous: bool,
     pub message: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -42,9 +38,19 @@ pub struct DonationReceipt {
     pub id: Uuid,
     pub campaign_id: Uuid,
     pub donor_id: Option<Uuid>,
+    pub donor_wallet_address: Option<String>,
+    pub recipient_wallet_address: Option<String>,
     pub amount: Decimal,
     pub currency: String,
+    pub payment_amount: Option<Decimal>,
+    pub payment_currency: Option<String>,
+    pub exchange_rate: Option<Decimal>,
+    pub exchange_rate_provider: Option<String>,
+    pub exchange_rate_at: Option<DateTime<Utc>>,
     pub status: String,
+    pub payment_method: Option<String>,
+    pub payment_provider: Option<String>,
+    pub payment_reference: Option<String>,
     pub is_anonymous: bool,
     pub message: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -59,10 +65,10 @@ pub struct DonationReceipt {
     pub transaction_confirmed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CreateDonation {
-    pub campaign_id: Uuid,
-    pub amount: Decimal,
-    pub is_anonymous: Option<bool>,
-    pub message: Option<String>,
+#[derive(Debug, Serialize)]
+pub struct DonationVerification {
+    pub donation_id: Uuid,
+    pub status: String,
+    pub transaction_hash: String,
+    pub confirmations: i32,
 }

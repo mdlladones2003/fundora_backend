@@ -35,6 +35,7 @@ pub struct CampaignDetails {
     pub id: Uuid,
     pub organizer_id: Uuid,
     pub organizer_name: Option<String>,
+    pub organizer_wallet_address: Option<String>,
     pub title: String,
     pub description: String,
     pub category: Option<String>,

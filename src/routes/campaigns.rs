@@ -38,7 +38,8 @@ pub async fn get(
     let campaign = sqlx::query_as::<_, CampaignDetails>(
         r#"
         SELECT c.id, c.organizer_id, u.display_name AS organizer_name,
-               c.title, c.description, c.category, c.beneficiary_name,
+               c.title, u.wallet_address AS organizer_wallet_address,
+               c.description, c.category, c.beneficiary_name,
                c.beneficiary_details, c.supporting_info, c.image_url,
                c.goal_amount, c.raised_amount, c.currency, c.network,
                c.contract_address, c.status, NULL::text AS review_feedback,
@@ -74,6 +75,21 @@ fn validate_schedule(
     Ok(())
 }
 
+fn validate_php_fundraising_goal(
+    goal_amount: Decimal,
+    currency: Option<&str>,
+) -> Result<(), AppError> {
+    if goal_amount <= Decimal::ZERO
+        || goal_amount.normalize().scale() > 2
+        || currency.is_some_and(|value| value != "PHP")
+    {
+        return Err(AppError::BadRequest(
+            "A positive PHP fundraising goal with at most two decimal places is required".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -83,12 +99,11 @@ pub async fn create(
         return Err(AppError::Forbidden);
     }
     validate_schedule(campaign.starts_at.as_ref(), campaign.ends_at.as_ref(), true)?;
+    validate_php_fundraising_goal(campaign.goal_amount, campaign.currency.as_deref())?;
     if campaign.title.trim().is_empty()
         || campaign.title.len() > 160
         || campaign.description.trim().is_empty()
         || campaign.description.len() > 10_000
-        || campaign.goal_amount <= Decimal::ZERO
-        || campaign.goal_amount.fract() != Decimal::ZERO
         || campaign
             .category
             .as_deref()
@@ -109,13 +124,9 @@ pub async fn create(
             .image_url
             .as_deref()
             .is_some_and(|value| value.len() > 2048)
-        || campaign
-            .currency
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "PHP" | "USD" | "EUR"))
     {
         return Err(AppError::BadRequest(
-            "A title, description, and positive goal amount are required".into(),
+            "A title, description, and positive PHP fundraising goal are required".into(),
         ));
     }
     let submit_for_review = campaign.submit_for_review.unwrap_or(false);
@@ -186,7 +197,7 @@ pub async fn update(
             .is_some_and(|description| description.trim().is_empty() || description.len() > 10_000)
         || campaign
             .goal_amount
-            .is_some_and(|amount| amount <= Decimal::ZERO || amount.fract() != Decimal::ZERO)
+            .is_some_and(|amount| amount <= Decimal::ZERO)
         || campaign
             .category
             .as_deref()
@@ -309,4 +320,25 @@ pub async fn update(
     }
     tx.commit().await?;
     Ok(Json(updated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_php_fundraising_goal;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    #[test]
+    fn requires_php_goals_with_cent_precision() {
+        assert!(
+            validate_php_fundraising_goal(Decimal::from_str("1000.50").unwrap(), Some("PHP"))
+                .is_ok()
+        );
+        assert!(validate_php_fundraising_goal(Decimal::from_str("1000").unwrap(), None).is_ok());
+        assert!(
+            validate_php_fundraising_goal(Decimal::from_str("1000.501").unwrap(), Some("PHP"))
+                .is_err()
+        );
+        assert!(validate_php_fundraising_goal(Decimal::ONE, Some("ETH")).is_err());
+    }
 }

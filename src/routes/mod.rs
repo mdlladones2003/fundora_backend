@@ -4,6 +4,7 @@ pub mod campaigns;
 pub mod dashboard;
 pub mod donations;
 pub mod notifications;
+pub mod payments;
 pub mod role_requests;
 pub mod transactions;
 pub mod withdrawals;
@@ -31,12 +32,27 @@ async fn auth_layer(
     let path = req.uri().path();
     let method = req.method();
 
-    let public_auth = path.contains("/auth/") && !path.ends_with("/auth/me");
+    let public_auth = [
+        "/auth/email/request",
+        "/auth/email/verify",
+        "/auth/refresh",
+        "/auth/logout",
+        "/auth/google",
+        "/auth/apple",
+        "/auth/siwe/nonce",
+        "/auth/siwe/verify",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix));
     let public_campaign_read = *method == axum::http::Method::GET
         && (path.ends_with("/campaigns") || path.contains("/campaigns/"))
         && !path.ends_with("/campaigns/mine")
         && !path.contains("/admin/");
-    if public_auth || public_campaign_read || path.contains("/webhooks/blockchain/confirm/") {
+    if public_auth
+        || public_campaign_read
+        || path.ends_with("/payments/config")
+        || path.ends_with("/webhooks/xendit")
+    {
         return Ok(next.run(req).await);
     }
 
@@ -96,15 +112,31 @@ pub fn router(s: AppState) -> Router {
         .route("/auth/apple", post(crate::auth::providers::apple))
         .route("/auth/siwe/nonce", post(crate::auth::siwe::nonce))
         .route("/auth/siwe/verify", post(crate::auth::siwe::verify))
+        .route(
+            "/auth/wallet/link/nonce",
+            post(crate::auth::siwe::wallet_link_nonce),
+        )
+        .route("/auth/wallet/link", post(crate::auth::siwe::link_wallet))
         .route("/campaigns", get(campaigns::list).post(campaigns::create))
         .route("/campaigns/mine", get(campaigns::list_mine))
         .route(
             "/campaigns/{id}",
             get(campaigns::get).patch(campaigns::update),
         )
-        .route("/donations", post(donations::create))
+        .route("/donations", post(payments::create))
         .route("/donations/my", get(donations::list_mine))
         .route("/donations/{id}", get(donations::get_mine))
+        .route("/donations/{id}/verify", post(donations::verify))
+        .route(
+            "/donations/{id}/payment-status",
+            get(payments::payment_status),
+        )
+        .route(
+            "/donations/{id}/simulate-payment",
+            post(payments::simulate_payment),
+        )
+        .route("/webhooks/xendit", post(payments::xendit_webhook))
+        .route("/payments/config", get(donations::payment_config))
         .route("/notifications/mine", get(notifications::list_mine))
         .route(
             "/notifications/{id}/read",
@@ -146,10 +178,6 @@ pub fn router(s: AppState) -> Router {
         )
         .route("/admin/withdrawals", get(admin::list_withdrawals))
         .route("/transactions", post(transactions::record))
-        .route(
-            "/webhooks/blockchain/confirm/{id}",
-            post(transactions::confirm),
-        )
         .route("/withdrawals", post(withdrawals::create))
         .route("/withdrawals/mine", get(withdrawals::list_mine))
         .route("/withdrawals/{id}/review", post(withdrawals::review))

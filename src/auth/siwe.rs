@@ -1,10 +1,10 @@
 use crate::{
     app::AppState,
-    auth::{otp, session},
+    auth::{AuthUser, otp, session},
     config::Config,
     error::AppError,
 };
-use axum::{Json, extract::State};
+use axum::{Extension, Json, extract::State};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -68,6 +68,16 @@ fn normalize_wallet_address(address: &str) -> Result<String, AppError> {
         return Err(AppError::Unauthorized);
     }
     Ok(format!("0x{}", hex.to_ascii_lowercase()))
+}
+
+fn siwe_uri_matches(message_uri: &str, configured_uri: &str) -> bool {
+    match (
+        reqwest::Url::parse(message_uri),
+        reqwest::Url::parse(configured_uri),
+    ) {
+        (Ok(message_uri), Ok(configured_uri)) => message_uri == configured_uri,
+        _ => false,
+    }
 }
 
 async fn wallet_account_exists(state: &AppState, address: &str) -> Result<bool, AppError> {
@@ -164,17 +174,19 @@ pub async fn nonce(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE siwe_nonces SET consumed_at=NOW() WHERE lower(wallet_address)=lower($1) AND consumed_at IS NULL",
+        "UPDATE siwe_nonces SET consumed_at=NOW() WHERE lower(wallet_address)=lower($1) AND purpose='login' AND consumed_at IS NULL",
     )
     .bind(&wallet)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("INSERT INTO siwe_nonces(wallet_address,nonce,expires_at) VALUES($1,$2,$3)")
-        .bind(&wallet)
-        .bind(&nonce)
-        .bind(expires_at)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO siwe_nonces(wallet_address,nonce,expires_at,purpose) VALUES($1,$2,$3,'login')",
+    )
+    .bind(&wallet)
+    .bind(&nonce)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
 
     Ok(Json(json!({
@@ -186,6 +198,62 @@ pub async fn nonce(
         "issued_at": Utc::now(),
         "expires_at": expires_at,
         "requires_email": requires_email
+    })))
+}
+
+pub async fn wallet_link_nonce(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Json(body): Json<SiweNonceRequest>,
+) -> Result<Json<Value>, AppError> {
+    let settings = settings(&state.config)?;
+    let wallet = normalize_wallet_address(&body.wallet_address)?;
+    let already_linked = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND lower(wallet_address)=lower($2))",
+    )
+    .bind(user.id)
+    .bind(&wallet)
+    .fetch_one(&state.pool)
+    .await?;
+    let owned_elsewhere = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE lower(wallet_address)=lower($1) AND id<>$2) OR EXISTS(SELECT 1 FROM auth_identities WHERE provider='metamask' AND lower(provider_subject)=lower($1) AND user_id<>$2)",
+    )
+    .bind(&wallet)
+    .bind(user.id)
+    .fetch_one(&state.pool)
+    .await?;
+    if owned_elsewhere {
+        return Err(AppError::Conflict(
+            "This wallet is already linked to another Fundora account.".into(),
+        ));
+    }
+
+    let nonce = siwe::generate_nonce();
+    let expires_at = Utc::now() + Duration::minutes(5);
+    sqlx::query(
+        "UPDATE siwe_nonces SET consumed_at=NOW() WHERE lower(wallet_address)=lower($1) AND purpose='wallet_link' AND consumed_at IS NULL",
+    )
+    .bind(&wallet)
+    .execute(&state.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO siwe_nonces(wallet_address,nonce,expires_at,purpose) VALUES($1,$2,$3,'wallet_link')",
+    )
+    .bind(&wallet)
+    .bind(&nonce)
+    .bind(expires_at)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "nonce": nonce,
+        "domain": settings.domain,
+        "uri": settings.uri,
+        "chain_id": settings.chain_id,
+        "statement": "Link wallet to your Fundora profile.",
+        "issued_at": Utc::now(),
+        "expires_at": expires_at,
+        "already_linked": already_linked
     })))
 }
 
@@ -203,7 +271,7 @@ pub async fn verify(
     let settings = settings(&state.config)?;
     let message: siwe::Message = body.message.parse().map_err(|_| AppError::Unauthorized)?;
     if message.domain.as_str() != settings.domain
-        || message.uri.to_string() != settings.uri
+        || !siwe_uri_matches(&message.uri.to_string(), &settings.uri)
         || message.chain_id != settings.chain_id
         || message.statement.as_deref() != Some("Sign in to Fundora.")
         || !message.valid_now()
@@ -235,7 +303,7 @@ pub async fn verify(
 
     let mut tx = state.pool.begin().await?;
     let challenge = sqlx::query(
-        "SELECT wallet_address FROM siwe_nonces WHERE nonce=$1 AND consumed_at IS NULL AND expires_at>NOW() FOR UPDATE",
+        "SELECT wallet_address FROM siwe_nonces WHERE nonce=$1 AND purpose='login' AND consumed_at IS NULL AND expires_at>NOW() FOR UPDATE",
     )
     .bind(&message.nonce)
     .fetch_optional(&mut *tx)
@@ -265,6 +333,131 @@ pub async fn verify(
     tx.commit().await?;
 
     complete_wallet_identity(&state, &wallet, email.as_deref()).await
+}
+
+#[derive(Deserialize)]
+pub struct WalletLinkRequest {
+    message: String,
+    signature: String,
+}
+
+pub async fn link_wallet(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Json(body): Json<WalletLinkRequest>,
+) -> Result<Json<Value>, AppError> {
+    let settings = settings(&state.config)?;
+    let message: siwe::Message = body.message.parse().map_err(|_| {
+        AppError::BadRequest("The MetaMask message is not a valid Fundora SIWE request.".into())
+    })?;
+    if message.domain.as_str() != settings.domain
+        || !siwe_uri_matches(&message.uri.to_string(), &settings.uri)
+        || message.chain_id != settings.chain_id
+        || message.statement.as_deref() != Some("Link wallet to your Fundora profile.")
+        || !message.valid_now()
+    {
+        return Err(AppError::BadRequest(
+            "The signed request does not match Fundora's SIWE settings or has expired. Please retry."
+                .into(),
+        ));
+    }
+
+    let signature_hex = body
+        .signature
+        .strip_prefix("0x")
+        .or_else(|| body.signature.strip_prefix("0X"))
+        .unwrap_or(&body.signature);
+    let signature: [u8; 65] = hex::decode(signature_hex)
+        .map_err(|_| AppError::BadRequest("MetaMask returned an invalid signature.".into()))?
+        .try_into()
+        .map_err(|_| AppError::BadRequest("MetaMask returned an invalid signature.".into()))?;
+    message
+        .verify_eip191(&signature)
+        .map_err(|_| {
+            AppError::BadRequest(
+                "MetaMask's signature could not be verified. Sign with the connected account and retry."
+                    .into(),
+            )
+        })?;
+    let wallet = normalize_wallet_address(&format!("0x{}", hex::encode(message.address)))?;
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('metamask'),hashtext($1))")
+        .bind(&wallet)
+        .execute(&mut *tx)
+        .await?;
+    let challenge = sqlx::query(
+        "SELECT wallet_address FROM siwe_nonces WHERE nonce=$1 AND purpose='wallet_link' AND consumed_at IS NULL AND expires_at>NOW() FOR UPDATE",
+    )
+    .bind(&message.nonce)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        AppError::BadRequest(
+            "The wallet verification request expired or was already used. Please retry.".into(),
+        )
+    })?;
+    let expected_wallet: String = challenge.try_get("wallet_address")?;
+    if !expected_wallet.eq_ignore_ascii_case(&wallet) {
+        return Err(AppError::BadRequest(
+            "The signature was made by a different wallet than the one selected. Please retry."
+                .into(),
+        ));
+    }
+
+    let owner = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM users WHERE lower(wallet_address)=lower($1) AND id<>$2",
+    )
+    .bind(&wallet)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let identity_owner = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM auth_identities WHERE provider='metamask' AND lower(provider_subject)=lower($1)",
+    )
+    .bind(&wallet)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if owner.is_some() || identity_owner.is_some_and(|id| id != user.id) {
+        return Err(AppError::Conflict(
+            "This wallet is already linked to another Fundora account.".into(),
+        ));
+    }
+
+    let current_wallet = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT wallet_address FROM users WHERE id=$1 FOR UPDATE",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if current_wallet
+        .as_deref()
+        .is_some_and(|current| !current.eq_ignore_ascii_case(&wallet))
+    {
+        return Err(AppError::Conflict(
+            "A wallet is already linked to this account. Contact support to change it.".into(),
+        ));
+    }
+
+    sqlx::query("UPDATE siwe_nonces SET consumed_at=NOW() WHERE nonce=$1")
+        .bind(&message.nonce)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE users SET wallet_address=$2,updated_at=NOW() WHERE id=$1")
+        .bind(user.id)
+        .bind(&wallet)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO auth_identities(user_id,provider,provider_subject,email,email_verified) VALUES($1,'metamask',$2,NULL,FALSE) ON CONFLICT(provider,provider_subject) DO NOTHING",
+    )
+    .bind(user.id)
+    .bind(&wallet)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(Json(json!({ "wallet_address": wallet })))
 }
 
 async fn complete_wallet_identity(
@@ -335,8 +528,8 @@ async fn complete_wallet_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_wallet_address, settings};
-    use crate::config::Config;
+    use super::{normalize_wallet_address, settings, siwe_uri_matches};
+    use crate::config::{Config, PaymentMode};
     use std::str::FromStr;
 
     fn test_config() -> Config {
@@ -345,7 +538,6 @@ mod tests {
             port: 8080,
             jwt_secret: String::new(),
             jwt_issuer: String::new(),
-            blockchain_webhook_secret: String::new(),
             frontend_origin: String::new(),
             email_from: String::new(),
             resend_api_key: String::new(),
@@ -354,6 +546,13 @@ mod tests {
             siwe_domain: "fundora.example".into(),
             siwe_uri: "https://fundora.example".into(),
             siwe_chain_id: Some(1),
+            evm_rpc_url: None,
+            evm_chain_id: 11155111,
+            evm_donation_contract: None,
+            evm_min_confirmations: 2,
+            payment_mode: PaymentMode::Disabled,
+            xendit_secret_key: None,
+            xendit_webhook_token: None,
         }
     }
 
@@ -398,5 +597,34 @@ Issued At: 2021-12-07T18:28:18.807Z";
         let tampered_message =
             siwe::Message::from_str(&raw_message.replace("Notepad", "Tampered")).unwrap();
         assert!(tampered_message.verify_eip191(&signature).is_err());
+    }
+
+    #[test]
+    fn matches_equivalent_root_siwe_uris() {
+        assert!(siwe_uri_matches(
+            "http://localhost:5173/",
+            "http://localhost:5173"
+        ));
+        assert!(!siwe_uri_matches(
+            "http://localhost:5173/other",
+            "http://localhost:5173"
+        ));
+    }
+
+    #[test]
+    fn parses_profile_wallet_link_message() {
+        let message = "localhost:5173 wants you to sign in with your Ethereum account:\n\
+            0x6Da01670d8fc844e736095918bbE11fE8D564163\n\
+            \n\
+            Link wallet to your Fundora profile.\n\
+            \n\
+            URI: http://localhost:5173\n\
+            Version: 1\n\
+            Chain ID: 11155111\n\
+            Nonce: kEWepMt9knR6lWJ6A\n\
+            Issued At: 2026-11-25T13:34:03.634Z\n\
+            Expiration Time: 2026-11-25T13:39:03.634Z";
+
+        assert!(message.parse::<siwe::Message>().is_ok());
     }
 }

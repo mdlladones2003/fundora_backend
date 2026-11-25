@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderValue, Method},
     routing::get,
 };
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 #[tokio::main]
@@ -23,7 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_env()?;
     let pool = database::connection::connect(&config.database_url).await?;
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    let mut schema_transaction = pool.begin().await?;
+    sqlx::raw_sql(include_str!("../schema.sql"))
+        .execute(&mut *schema_transaction)
+        .await?;
+    schema_transaction.commit().await?;
 
     let port = config.port;
     let mut origins: Vec<HeaderValue> = config
@@ -42,6 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         http: reqwest::Client::new(),
     };
+    if state.config.payment_mode == config::PaymentMode::Xendit {
+        let payment_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(error) =
+                    routes::payments::poll_pending_xendit_sessions(&payment_state).await
+                {
+                    tracing::error!(%error, "Xendit payment verification poll failed");
+                }
+            }
+        });
+    }
     let cors = CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([

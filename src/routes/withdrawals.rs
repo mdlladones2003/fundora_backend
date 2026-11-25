@@ -46,7 +46,13 @@ pub async fn list_mine(
     let rows = sqlx::query_as::<_, OrganizerWithdrawal>(
         r#"
         SELECT w.*, c.title AS campaign_title, c.currency,
-            GREATEST(c.raised_amount - COALESCE((
+            GREATEST(COALESCE((
+                SELECT SUM(d.amount)
+                FROM donations d
+                WHERE d.campaign_id = c.id
+                  AND d.status = 'confirmed'
+                  AND d.payment_currency IS DISTINCT FROM 'ETH'
+            ), 0) - COALESCE((
                 SELECT SUM(reserved.amount)
                 FROM withdrawals reserved
                 WHERE reserved.campaign_id = c.id
@@ -85,14 +91,30 @@ pub async fn create(
     }
 
     let mut tx = state.pool.begin().await?;
-    let campaign = sqlx::query_as::<_, (Decimal, String, String)>(
-        "SELECT raised_amount, title, currency FROM campaigns WHERE id = $1 AND organizer_id = $2 FOR UPDATE",
+    let campaign = sqlx::query_as::<_, (String, String)>(
+        "SELECT title, currency FROM campaigns WHERE id = $1 AND organizer_id = $2 FOR UPDATE",
     )
     .bind(request.campaign_id)
     .bind(user.id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(AppError::NotFound)?;
+    if campaign.1 == "ETH" {
+        return Err(AppError::Conflict(
+            "ETH contributions are sent directly to the organizer wallet and cannot be withdrawn through Fundora.".into(),
+        ));
+    }
+    let collected_balance = sqlx::query_scalar::<_, Decimal>(
+        r#"
+        SELECT COALESCE(SUM(amount), 0)
+        FROM donations
+        WHERE campaign_id = $1 AND status = 'confirmed'
+          AND payment_currency IS DISTINCT FROM 'ETH'
+        "#,
+    )
+    .bind(request.campaign_id)
+    .fetch_one(&mut *tx)
+    .await?;
     let reserved = sqlx::query_scalar::<_, Decimal>(
         r#"
         SELECT COALESCE(SUM(amount), 0)
@@ -103,11 +125,11 @@ pub async fn create(
     .bind(request.campaign_id)
     .fetch_one(&mut *tx)
     .await?;
-    let available = (campaign.0 - reserved).max(Decimal::ZERO);
+    let available = (collected_balance - reserved).max(Decimal::ZERO);
     if request.amount > available {
         return Err(AppError::BadRequest(format!(
             "Requested amount exceeds the available balance of {} {}",
-            available, campaign.2
+            available, campaign.1
         )));
     }
 
@@ -134,7 +156,7 @@ pub async fn create(
         json!({
             "campaign_id": request.campaign_id,
             "amount": request.amount,
-            "currency": campaign.2
+            "currency": campaign.1
         }),
     )
     .await?;
@@ -144,7 +166,7 @@ pub async fn create(
         "Withdrawal request needs review",
         &format!(
             "{} requested {} {} for {}",
-            user.email, request.amount, campaign.2, campaign.1
+            user.email, request.amount, campaign.1, campaign.0
         ),
         Some("/admin/withdrawals"),
     )
@@ -197,8 +219,17 @@ pub async fn review(
         ));
     }
 
-    let raised_amount = sqlx::query_scalar::<_, Decimal>(
-        "SELECT raised_amount FROM campaigns WHERE id = $1 FOR UPDATE",
+    sqlx::query("SELECT id FROM campaigns WHERE id = $1 FOR UPDATE")
+        .bind(campaign_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let collected_balance = sqlx::query_scalar::<_, Decimal>(
+        r#"
+        SELECT COALESCE(SUM(amount), 0)
+        FROM donations
+        WHERE campaign_id = $1 AND status = 'confirmed'
+          AND payment_currency IS DISTINCT FROM 'ETH'
+        "#,
     )
     .bind(campaign_id)
     .fetch_one(&mut *tx)
@@ -215,7 +246,7 @@ pub async fn review(
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        if amount > (raised_amount - other_reserved).max(Decimal::ZERO) {
+        if amount > (collected_balance - other_reserved).max(Decimal::ZERO) {
             return Err(AppError::BadRequest(
                 "The campaign no longer has enough available balance to approve this request"
                     .into(),

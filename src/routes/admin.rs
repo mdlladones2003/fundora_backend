@@ -41,6 +41,11 @@ pub struct AdminDonation {
     pub donor_id: Option<Uuid>,
     pub amount: Decimal,
     pub currency: String,
+    pub payment_amount: Option<Decimal>,
+    pub payment_currency: Option<String>,
+    pub exchange_rate: Option<Decimal>,
+    pub exchange_rate_provider: Option<String>,
+    pub exchange_rate_at: Option<DateTime<Utc>>,
     pub status: String,
     pub is_anonymous: bool,
     pub message: Option<String>,
@@ -202,7 +207,8 @@ pub async fn list_campaigns(
     require_admin(&user)?;
     let campaigns = sqlx::query_as::<_, CampaignDetails>(
         r#"
-        SELECT c.*, u.display_name AS organizer_name
+        SELECT c.*, u.display_name AS organizer_name,
+               u.wallet_address AS organizer_wallet_address
         FROM campaigns c
         JOIN users u ON u.id = c.organizer_id
         ORDER BY c.created_at DESC
@@ -701,7 +707,13 @@ pub async fn list_withdrawals(
     let withdrawals = sqlx::query_as::<_, AdminWithdrawal>(
         r#"
         SELECT w.*, c.title AS campaign_title, c.currency, u.email AS requester_email,
-            GREATEST(c.raised_amount - COALESCE((
+            GREATEST(COALESCE((
+                SELECT SUM(d.amount)
+                FROM donations d
+                WHERE d.campaign_id = c.id
+                  AND d.status = 'confirmed'
+                  AND d.payment_currency IS DISTINCT FROM 'ETH'
+            ), 0) - COALESCE((
                 SELECT SUM(reserved.amount)
                 FROM withdrawals reserved
                 WHERE reserved.campaign_id = c.id

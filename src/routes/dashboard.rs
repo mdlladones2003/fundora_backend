@@ -50,7 +50,15 @@ pub struct OrganizerDonation {
     pub donor_name: String,
     pub amount: Decimal,
     pub currency: String,
+    pub payment_amount: Option<Decimal>,
+    pub payment_currency: Option<String>,
+    pub exchange_rate: Option<Decimal>,
+    pub exchange_rate_provider: Option<String>,
+    pub exchange_rate_at: Option<DateTime<Utc>>,
     pub status: String,
+    pub payment_method: Option<String>,
+    pub payment_provider: Option<String>,
+    pub payment_reference: Option<String>,
     pub created_at: DateTime<Utc>,
     pub confirmed_at: Option<DateTime<Utc>>,
     pub transaction_hash: Option<String>,
@@ -214,12 +222,16 @@ pub async fn organizer_donations(
         SELECT d.id, d.campaign_id, c.title AS campaign_title,
                CASE WHEN d.is_anonymous THEN 'Anonymous donor'
                     ELSE COALESCE(u.display_name, 'Fundora donor') END AS donor_name,
-               d.amount, d.currency, d.status, d.created_at, d.confirmed_at,
+               d.amount, d.currency, d.payment_amount, d.payment_currency,
+               d.exchange_rate, d.exchange_rate_provider, d.exchange_rate_at,
+               d.status, p.method AS payment_method, p.provider AS payment_provider,
+               p.session_id AS payment_reference, d.created_at, d.confirmed_at,
                t.tx_hash AS transaction_hash, t.network AS transaction_network,
                t.status AS transaction_status, t.verified AS transaction_verified
         FROM donations d
         JOIN campaigns c ON c.id = d.campaign_id
         LEFT JOIN users u ON u.id = d.donor_id
+        LEFT JOIN payment_attempts p ON p.donation_id = d.id
         LEFT JOIN LATERAL (
             SELECT tx_hash, network, status, verified FROM blockchain_transactions
             WHERE donation_id = d.id
