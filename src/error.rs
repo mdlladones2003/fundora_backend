@@ -17,6 +17,8 @@ pub enum AppError {
     NotFound,
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("{0}")]
+    ServiceUnavailable(&'static str),
     #[error("internal server error")]
     Internal,
 }
@@ -33,6 +35,9 @@ impl IntoResponse for AppError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),
                 )
+            }
+            Self::ServiceUnavailable(message) => {
+                (StatusCode::SERVICE_UNAVAILABLE, message.to_string())
             }
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,

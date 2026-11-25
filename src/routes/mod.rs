@@ -121,6 +121,7 @@ pub fn router(s: AppState) -> Router {
             "/admin/role-requests/{id}/review",
             post(role_requests::review),
         )
+        .route("/admin/summary", get(admin::summary))
         .route("/admin/campaigns", get(admin::list_campaigns))
         .route(
             "/admin/campaigns/{id}",

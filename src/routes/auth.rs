@@ -15,38 +15,25 @@ pub struct EmailRequest {
     pub email: String,
 }
 
-fn is_valid_email(email: &str) -> bool {
-    if email.is_empty() || email.len() > 254 {
-        return false;
-    }
-    match email.split_once('@') {
-        Some((local, domain)) => {
-            !local.is_empty()
-                && domain.contains('.')
-                && !domain.starts_with('.')
-                && !domain.ends_with('.')
-        }
-        None => false,
-    }
-}
-
 pub async fn request_email_code(
     State(s): State<AppState>,
     Json(b): Json<EmailRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let email = b.email.trim().to_lowercase();
-    if !is_valid_email(&email)
-        || s.config.resend_api_key.trim().is_empty()
-        || s.config.email_from.trim().is_empty()
-    {
-        return Err(AppError::BadRequest(
-            "Valid email and email provider configuration are required".into(),
+    if !otp::is_valid_email(&email) {
+        return Err(AppError::BadRequest("Enter a valid email address".into()));
+    }
+    if s.config.resend_api_key.trim().is_empty() || s.config.email_from.trim().is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "Email sign-in is unavailable. Check the email provider configuration.",
         ));
     }
 
     let pepper = std::env::var("OTP_PEPPER").map_err(|e| {
         tracing::error!("OTP_PEPPER is missing or invalid: {e}");
-        AppError::Internal
+        AppError::ServiceUnavailable(
+            "Email sign-in is unavailable. Configure OTP_PEPPER on the backend.",
+        )
     })?;
 
     let recent: bool = sqlx::query_scalar(
@@ -85,14 +72,15 @@ pub async fn request_email_code(
         .await
         .map_err(|e| {
             tracing::error!("Failed to send request to Resend: {e}");
-            AppError::Internal
+            AppError::ServiceUnavailable("Email delivery is unavailable. Try again later.")
         })?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let err_body = response.text().await.unwrap_or_default();
-        tracing::warn!("Resend rejected email ({status}): {err_body}");
-        return Err(AppError::Internal);
+        tracing::warn!("Resend rejected email ({status})");
+        return Err(AppError::ServiceUnavailable(
+            "Email delivery failed. Check the sender domain and recipient authorization with your email provider.",
+        ));
     }
 
     let mut tx = s.pool.begin().await?;
@@ -126,13 +114,15 @@ pub async fn verify_email_code(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let email = b.email.trim().to_lowercase();
     let code = b.code.trim();
-    if !is_valid_email(&email) || code.is_empty() {
+    if !otp::is_valid_email(&email) || code.is_empty() {
         return Err(AppError::Unauthorized);
     }
 
     let pepper = std::env::var("OTP_PEPPER").map_err(|e| {
         tracing::error!("OTP_PEPPER is missing or invalid: {e}");
-        AppError::Internal
+        AppError::ServiceUnavailable(
+            "Email sign-in is unavailable. Configure OTP_PEPPER on the backend.",
+        )
     })?;
 
     let hash = otp::hash_code(&email, code, &pepper);

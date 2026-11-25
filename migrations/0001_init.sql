@@ -6,7 +6,6 @@ CREATE TABLE roles (
     description TEXT
 );
 INSERT INTO roles(name,description) VALUES
-    ('guest','Unauthenticated visitor'),
     ('donor','Can donate and view own activity'),
     ('organizer','Can manage own campaigns and request withdrawals'),
     ('administrator','Platform administrator')

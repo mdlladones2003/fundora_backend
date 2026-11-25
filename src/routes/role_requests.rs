@@ -64,7 +64,7 @@ pub async fn request_organizer(
         "administrator",
         "Organizer access request",
         &format!("{} requested organizer access.", user.email),
-        Some("/dashboard/administrator#admin-users"),
+        Some("/admin/role-requests"),
     )
     .await?;
     activity_repository::record_audit(

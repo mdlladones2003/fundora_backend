@@ -31,12 +31,6 @@ pub async fn list_for_organizer(
         .await
 }
 
-pub async fn list_all(pool: &PgPool) -> Result<Vec<Campaign>, sqlx::Error> {
-    sqlx::query_as("SELECT * FROM campaigns ORDER BY created_at DESC")
-        .fetch_all(pool)
-        .await
-}
-
 pub async fn create(
     tx: &mut Transaction<'_, Postgres>,
     owner: Uuid,

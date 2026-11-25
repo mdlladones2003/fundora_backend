@@ -146,7 +146,7 @@ pub async fn create(
             "{} requested {} {} for {}",
             user.email, request.amount, campaign.2, campaign.1
         ),
-        Some("/dashboard/administrator"),
+        Some("/admin/withdrawals"),
     )
     .await?;
     tx.commit().await?;
@@ -259,7 +259,7 @@ pub async fn review(
         } else {
             reason.unwrap_or("The administrator rejected this request.")
         },
-        Some("/dashboard/organizer"),
+        Some("/organizer/withdrawals"),
     )
     .await?;
     tx.commit().await?;

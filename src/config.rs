@@ -10,11 +10,19 @@ pub struct Config {
     pub resend_api_key: String,
     pub google_client_id: String,
     pub apple_client_id: String,
+    pub siwe_domain: String,
+    pub siwe_uri: String,
+    pub siwe_chain_id: Option<u64>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         let jwt_secret = std::env::var("JWT_SECRET")?;
+        let siwe_chain_id = std::env::var("SIWE_CHAIN_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.parse::<u64>())
+            .transpose()?;
 
         if jwt_secret.len() < 32 {
             return Err("JWT_SECRET must be at least 32 characters".into());
@@ -35,6 +43,9 @@ impl Config {
             resend_api_key: std::env::var("RESEND_API_KEY").unwrap_or_default(),
             google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
             apple_client_id: std::env::var("APPLE_CLIENT_ID").unwrap_or_default(),
+            siwe_domain: std::env::var("SIWE_DOMAIN").unwrap_or_default(),
+            siwe_uri: std::env::var("SIWE_URI").unwrap_or_default(),
+            siwe_chain_id,
         })
     }
 }

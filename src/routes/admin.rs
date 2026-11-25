@@ -14,7 +14,7 @@ use crate::{
     auth::{AuthUser, has_role},
     database::{
         models::{
-            campaign::{Campaign, UpdateCampaign},
+            campaign::{Campaign, CampaignDetails, UpdateCampaign},
             role::Role,
         },
         repositories::{activity_repository, campaign_repository},
@@ -108,6 +108,33 @@ pub struct AdminTransaction {
     pub flagged_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdminDashboardCounts {
+    pub total_users: i64,
+    pub total_donors: i64,
+    pub total_organizers: i64,
+    pub total_campaigns: i64,
+    pub active_campaigns: i64,
+    pub confirmed_donations: i64,
+    pub pending_withdrawals: i64,
+    pub total_transactions: i64,
+    pub confirmed_transactions: i64,
+    pub flagged_transactions: i64,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdminCurrencyTotal {
+    pub currency: String,
+    pub amount: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardSummary {
+    #[serde(flatten)]
+    pub counts: AdminDashboardCounts,
+    pub confirmed_donation_value: Vec<AdminCurrencyTotal>,
+}
+
 fn require_admin(user: &AuthUser) -> Result<(), AppError> {
     if has_role(user, &["administrator"]) {
         Ok(())
@@ -116,12 +143,74 @@ fn require_admin(user: &AuthUser) -> Result<(), AppError> {
     }
 }
 
+pub async fn summary(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<AdminDashboardSummary>, AppError> {
+    require_admin(&user)?;
+    let counts = sqlx::query_as::<_, AdminDashboardCounts>(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM users) AS total_users,
+            (SELECT COUNT(*) FROM users u WHERE COALESCE((
+                SELECT r.name FROM user_roles ur
+                JOIN roles r ON r.id = ur.role_id
+                WHERE ur.user_id = u.id
+                ORDER BY CASE r.name WHEN 'administrator' THEN 3 WHEN 'organizer' THEN 2 WHEN 'donor' THEN 1 ELSE 0 END DESC
+                LIMIT 1
+            ), 'donor') = 'donor') AS total_donors,
+            (SELECT COUNT(*) FROM users u WHERE COALESCE((
+                SELECT r.name FROM user_roles ur
+                JOIN roles r ON r.id = ur.role_id
+                WHERE ur.user_id = u.id
+                ORDER BY CASE r.name WHEN 'administrator' THEN 3 WHEN 'organizer' THEN 2 WHEN 'donor' THEN 1 ELSE 0 END DESC
+                LIMIT 1
+            ), 'donor') = 'organizer') AS total_organizers,
+            (SELECT COUNT(*) FROM campaigns) AS total_campaigns,
+            (SELECT COUNT(*) FROM campaigns WHERE status IN ('published', 'active')) AS active_campaigns,
+            (SELECT COUNT(*) FROM donations WHERE status = 'confirmed') AS confirmed_donations,
+            (SELECT COUNT(*) FROM withdrawals WHERE status = 'pending') AS pending_withdrawals,
+            (SELECT COUNT(*) FROM blockchain_transactions) AS total_transactions,
+            (SELECT COUNT(*) FROM blockchain_transactions WHERE status = 'confirmed') AS confirmed_transactions,
+            (SELECT COUNT(*) FROM blockchain_transactions WHERE review_note IS NOT NULL) AS flagged_transactions
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    let confirmed_donation_value = sqlx::query_as::<_, AdminCurrencyTotal>(
+        r#"
+        SELECT currency, SUM(amount) AS amount
+        FROM donations
+        WHERE status = 'confirmed'
+        GROUP BY currency
+        ORDER BY currency
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(AdminDashboardSummary {
+        counts,
+        confirmed_donation_value,
+    }))
+}
+
 pub async fn list_campaigns(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-) -> Result<Json<Vec<Campaign>>, AppError> {
+) -> Result<Json<Vec<CampaignDetails>>, AppError> {
     require_admin(&user)?;
-    Ok(Json(campaign_repository::list_all(&state.pool).await?))
+    let campaigns = sqlx::query_as::<_, CampaignDetails>(
+        r#"
+        SELECT c.*, u.display_name AS organizer_name
+        FROM campaigns c
+        JOIN users u ON u.id = c.organizer_id
+        ORDER BY c.created_at DESC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(campaigns))
 }
 
 pub async fn update_campaign(
@@ -267,7 +356,7 @@ pub async fn review_campaign(
         campaign.organizer_id,
         title,
         reason.unwrap_or("Your campaign is now visible to donors."),
-        Some("/dashboard/organizer"),
+        Some("/organizer/campaigns"),
     )
     .await?;
     tx.commit().await?;
@@ -593,7 +682,7 @@ pub async fn list_donations(
         JOIN campaigns c ON c.id=d.campaign_id
         LEFT JOIN users u ON u.id=d.donor_id
         LEFT JOIN LATERAL (
-            SELECT tx_hash FROM blockchain_transactions
+            SELECT tx_hash, network, status, verified FROM blockchain_transactions
             WHERE donation_id=d.id ORDER BY created_at DESC LIMIT 1
         ) t ON TRUE
         ORDER BY d.created_at DESC

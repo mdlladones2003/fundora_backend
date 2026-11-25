@@ -159,7 +159,7 @@ pub async fn create(
             "administrator",
             "Campaign needs review",
             &format!("{} submitted a campaign for approval.", user.email),
-            Some("/dashboard/administrator#campaign-approvals"),
+            Some("/admin/campaigns"),
         )
         .await?;
     }
@@ -303,7 +303,7 @@ pub async fn update(
             "administrator",
             "Campaign needs review",
             &format!("{} resubmitted a campaign for approval.", user.email),
-            Some("/dashboard/administrator#campaign-approvals"),
+            Some("/admin/campaigns"),
         )
         .await?;
     }
