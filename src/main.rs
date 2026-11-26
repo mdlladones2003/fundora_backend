@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if state.config.payment_mode == config::PaymentMode::Xendit {
         let payment_state = state.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
                 if let Err(error) =

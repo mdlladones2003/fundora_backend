@@ -21,6 +21,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("{0}")]
     ServiceUnavailable(&'static str),
+    #[error("external payment provider rejected the request")]
+    ProviderRejected { code: String },
     #[error("internal server error")]
     Internal,
 }
@@ -41,6 +43,12 @@ impl IntoResponse for AppError {
             Self::ServiceUnavailable(message) => {
                 (StatusCode::SERVICE_UNAVAILABLE, message.to_string())
             }
+            Self::ProviderRejected { code } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Xendit rejected checkout creation (provider code: {code}). Verify the test-mode account and selected payment method."
+                ),
+            ),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,

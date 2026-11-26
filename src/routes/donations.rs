@@ -128,7 +128,7 @@ pub async fn verify(
     Path(id): Path<Uuid>,
     Json(body): Json<VerifyDonationRequest>,
 ) -> Result<Json<DonationVerification>, AppError> {
-    if !has_role(&user, &["donor"]) {
+    if !has_role(&user, &["donor", "organizer"]) {
         return Err(AppError::Forbidden);
     }
 
@@ -319,7 +319,7 @@ pub async fn list_mine(
     State(s): State<AppState>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Vec<crate::database::models::donation::DonationHistory>>, AppError> {
-    if !has_role(&user, &["donor"]) {
+    if !has_role(&user, &["donor", "organizer"]) {
         return Err(AppError::Forbidden);
     }
     let donations = sqlx::query_as::<_, crate::database::models::donation::DonationHistory>(
@@ -353,7 +353,7 @@ pub async fn get_mine(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<DonationReceipt>, AppError> {
-    if !has_role(&user, &["donor"]) {
+    if !has_role(&user, &["donor", "organizer"]) {
         return Err(AppError::Forbidden);
     }
     let receipt = sqlx::query_as::<_, DonationReceipt>(

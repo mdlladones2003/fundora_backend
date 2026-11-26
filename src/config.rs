@@ -12,6 +12,7 @@ pub struct Config {
     pub jwt_secret: String,
     pub jwt_issuer: String,
     pub frontend_origin: String,
+    pub xendit_return_origin: Option<String>,
     pub email_from: String,
     pub resend_api_key: String,
     pub google_client_id: String,
@@ -63,6 +64,10 @@ impl Config {
         let xendit_webhook_token = std::env::var("XENDIT_WEBHOOK_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        let xendit_return_origin = std::env::var("XENDIT_RETURN_ORIGIN")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
 
         if jwt_secret.len() < 32 || evm_min_confirmations == 0 {
             return Err("JWT_SECRET must be at least 32 characters and EVM_MIN_CONFIRMATIONS must be positive".into());
@@ -84,6 +89,12 @@ impl Config {
                 "Only an Xendit Test Mode secret key is accepted when PAYMENT_MODE=xendit".into(),
             );
         }
+        if xendit_return_origin
+            .as_deref()
+            .is_some_and(|origin| !valid_xendit_return_origin(origin))
+        {
+            return Err("XENDIT_RETURN_ORIGIN must be a valid HTTPS URL".into());
+        }
 
         Ok(Self {
             database_url: std::env::var("DATABASE_URL")?,
@@ -94,6 +105,7 @@ impl Config {
             jwt_issuer: std::env::var("JWT_ISSUER").unwrap_or_else(|_| "fundora".into()),
             frontend_origin: std::env::var("FRONTEND_ORIGIN")
                 .unwrap_or_else(|_| "http://localhost:5173".into()),
+            xendit_return_origin,
             email_from: std::env::var("EMAIL_FROM").unwrap_or_default(),
             resend_api_key: std::env::var("RESEND_API_KEY").unwrap_or_default(),
             google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
@@ -116,4 +128,13 @@ impl Config {
             xendit_webhook_token,
         })
     }
+}
+
+fn valid_xendit_return_origin(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }

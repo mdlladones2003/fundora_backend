@@ -75,6 +75,13 @@ CREATE TABLE IF NOT EXISTS campaigns (
 CREATE INDEX IF NOT EXISTS campaigns_status_created_idx
     ON campaigns(status, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS campaign_views (
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    session_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (campaign_id, session_id)
+);
+
 CREATE TABLE IF NOT EXISTS donations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     campaign_id UUID NOT NULL REFERENCES campaigns(id),

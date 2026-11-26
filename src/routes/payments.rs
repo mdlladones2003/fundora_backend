@@ -69,6 +69,50 @@ fn xendit_channel(method: &str) -> &'static str {
     }
 }
 
+fn safe_xendit_error_code(payload: Option<&Value>) -> String {
+    payload
+        .and_then(|value| value.get("error_code"))
+        .and_then(Value::as_str)
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| "UNKNOWN".into())
+}
+
+fn build_xendit_session_payload(
+    donation_id: Uuid,
+    campaign_id: Uuid,
+    amount: serde_json::Number,
+    method: &str,
+    campaign_title: &str,
+    frontend_origin: &str,
+) -> Value {
+    let mut body = json!({
+        "reference_id": donation_id.to_string(),
+        "session_type": "PAY",
+        "mode": "PAYMENT_LINK",
+        "allow_save_payment_method": "DISABLED",
+        "amount": amount,
+        "currency": "PHP",
+        "country": "PH",
+        "allowed_payment_channels": [xendit_channel(method)],
+        "description": format!("Fundora contribution: {campaign_title}"),
+        "locale": "en"
+    });
+    if let Some(url) = build_return_url(frontend_origin, campaign_id, donation_id, false) {
+        body["success_return_url"] = Value::String(url);
+    }
+    if let Some(url) = build_return_url(frontend_origin, campaign_id, donation_id, true) {
+        body["cancel_return_url"] = Value::String(url);
+    }
+    body
+}
+
 fn session_channels_match(channels: Option<&[String]>, method: &str) -> bool {
     channels.is_none_or(|channels| channels.len() == 1 && channels[0] == xendit_channel(method))
 }
@@ -87,6 +131,15 @@ fn validate_contribution_amount(amount: Decimal) -> Result<(), AppError> {
     if amount < Decimal::ONE || amount > Decimal::from(100_000) || amount.scale() > 2 {
         return Err(AppError::BadRequest(
             "Contribution must be PHP 1 to 100,000 with at most two decimal places.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_contribution_goal_limit(amount: Decimal, goal_amount: Decimal) -> Result<(), AppError> {
+    if amount > goal_amount {
+        return Err(AppError::BadRequest(
+            "Contribution cannot exceed the campaign fundraising goal.".into(),
         ));
     }
     Ok(())
@@ -136,7 +189,7 @@ pub async fn create(
     Extension(user): Extension<AuthUser>,
     Json(request): Json<CreatePaymentRequest>,
 ) -> Result<Json<PaymentStatus>, AppError> {
-    if !has_role(&user, &["donor"]) {
+    if !has_role(&user, &["donor", "organizer"]) {
         return Err(AppError::Forbidden);
     }
     if state.config.payment_mode == PaymentMode::Disabled {
@@ -156,8 +209,9 @@ pub async fn create(
         ));
     }
 
-    let (campaign_title, currency) = sqlx::query_as::<_, (String, String)>(
-        "SELECT title, currency FROM campaigns WHERE id=$1 AND status IN ('published','active')",
+    let (campaign_title, currency, goal_amount) =
+        sqlx::query_as::<_, (String, String, Decimal)>(
+        "SELECT title, currency, goal_amount FROM campaigns WHERE id=$1 AND status IN ('published','active')",
     )
     .bind(request.campaign_id)
     .fetch_optional(&state.pool)
@@ -168,6 +222,7 @@ pub async fn create(
             "GCash and Maya contributions require a PHP-denominated campaign.".into(),
         ));
     }
+    validate_contribution_goal_limit(request.amount, goal_amount)?;
 
     let donation_id = Uuid::new_v4();
     let reference_id = donation_id.to_string();
@@ -296,35 +351,18 @@ async fn create_xendit_session(
         ))?;
     let amount = serde_json::Number::from_str(&amount.normalize().to_string())
         .map_err(|_| AppError::Internal)?;
-    let allowed_payment_channel = xendit_channel(method);
-    let mut body = json!({
-        "reference_id": donation_id.to_string(),
-        "session_type": "PAY",
-        "mode": "PAYMENT_LINK",
-        "allow_save_payment_method": "DISABLED",
-        "amount": amount,
-        "currency": "PHP",
-        "country": "PH",
-        "allowed_payment_channels": [allowed_payment_channel],
-        "description": format!("Fundora contribution: {campaign_title}"),
-        "locale": "en"
-    });
-    if let Some(url) = build_return_url(
-        &state.config.frontend_origin,
-        campaign_id,
+    let body = build_xendit_session_payload(
         donation_id,
-        false,
-    ) {
-        body["success_return_url"] = Value::String(url);
-    }
-    if let Some(url) = build_return_url(
-        &state.config.frontend_origin,
         campaign_id,
-        donation_id,
-        true,
-    ) {
-        body["cancel_return_url"] = Value::String(url);
-    }
+        amount,
+        method,
+        campaign_title,
+        state
+            .config
+            .xendit_return_origin
+            .as_deref()
+            .unwrap_or(&state.config.frontend_origin),
+    );
 
     let response = state
         .http
@@ -341,19 +379,13 @@ async fn create_xendit_session(
     if !response.status().is_success() {
         let status = response.status();
         let provider_error = response.json::<Value>().await.ok();
-        let error_code = provider_error
-            .as_ref()
-            .and_then(|payload| payload.get("error_code"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+        let error_code = safe_xendit_error_code(provider_error.as_ref());
         tracing::warn!(
             %status,
-            error_code,
+            %error_code,
             "Xendit rejected a payment session request"
         );
-        return Err(AppError::ServiceUnavailable(
-            "Xendit checkout could not be created. Check the sandbox account and enabled payment methods.",
-        ));
+        return Err(AppError::ProviderRejected { code: error_code });
     }
     response.json().await.map_err(|error| {
         tracing::warn!(%error, "Could not parse Xendit payment session response");
@@ -413,7 +445,7 @@ pub async fn payment_status(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PaymentStatus>, AppError> {
-    if !has_role(&user, &["donor"]) {
+    if !has_role(&user, &["donor", "organizer"]) {
         return Err(AppError::Forbidden);
     }
     let mut status = load_payment_status(&state, id, Some(user.id)).await?;
@@ -446,7 +478,7 @@ pub async fn poll_pending_xendit_sessions(state: &AppState) -> Result<(), AppErr
           AND p.status='pending'
           AND d.status='pending'
           AND p.session_id IS NOT NULL
-          AND p.updated_at <= now() - interval '30 seconds'
+          AND p.updated_at <= now() - interval '2 seconds'
         ORDER BY p.updated_at
         LIMIT 25
         "#,
@@ -485,7 +517,7 @@ pub async fn simulate_payment(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PaymentStatus>, AppError> {
-    if !has_role(&user, &["donor"]) {
+    if !has_role(&user, &["donor", "organizer"]) {
         return Err(AppError::Forbidden);
     }
     if state.config.payment_mode != PaymentMode::Mock {
@@ -786,8 +818,10 @@ pub async fn xendit_webhook(
 #[cfg(test)]
 mod tests {
     use super::{
-        CreatePaymentRequest, build_return_url, normalize_payment_method, session_channels_match,
-        token_matches, valid_checkout_url, valid_session_id, validate_contribution_amount,
+        CreatePaymentRequest, build_return_url, build_xendit_session_payload,
+        normalize_payment_method, safe_xendit_error_code, session_channels_match, token_matches,
+        valid_checkout_url, valid_session_id, validate_contribution_amount,
+        validate_contribution_goal_limit,
     };
     use rust_decimal::Decimal;
     use serde_json::json;
@@ -834,6 +868,16 @@ mod tests {
     }
 
     #[test]
+    fn limits_contributions_to_the_campaign_fundraising_goal() {
+        let goal = Decimal::from_str("2500.50").unwrap();
+        assert!(validate_contribution_goal_limit(goal, goal).is_ok());
+        assert!(
+            validate_contribution_goal_limit(Decimal::from_str("2500.51").unwrap(), goal).is_err()
+        );
+        assert!(validate_contribution_goal_limit(Decimal::from(100_000), goal).is_err());
+    }
+
+    #[test]
     fn only_accepts_xendit_hosted_checkout_urls_and_session_ids() {
         assert!(valid_checkout_url(
             "https://checkout-staging.xendit.co/sessions/ps-661f87c614802d6c402cd82d"
@@ -860,6 +904,58 @@ mod tests {
     }
 
     #[test]
+    fn exposes_only_sanitized_xendit_error_codes() {
+        assert_eq!(
+            safe_xendit_error_code(Some(&json!({"error_code": "API_VALIDATION_ERROR"}))),
+            "API_VALIDATION_ERROR"
+        );
+        assert_eq!(
+            safe_xendit_error_code(Some(&json!({"error_code": "bad code"}))),
+            "UNKNOWN"
+        );
+        assert_eq!(safe_xendit_error_code(None), "UNKNOWN");
+    }
+
+    #[test]
+    fn builds_xendit_one_time_payment_session_for_gcash_and_maya() {
+        for (method, channel) in [("GCASH", "GCASH"), ("MAYA", "PAYMAYA")] {
+            let payload = build_xendit_session_payload(
+                Uuid::nil(),
+                Uuid::max(),
+                serde_json::Number::from(100),
+                method,
+                "Community campaign",
+                "http://localhost:5173",
+            );
+            assert_eq!(payload["session_type"], "PAY");
+            assert_eq!(payload["mode"], "PAYMENT_LINK");
+            assert_eq!(payload["allow_save_payment_method"], "DISABLED");
+            assert_eq!(payload["allowed_payment_channels"], json!([channel]));
+            assert_eq!(payload["currency"], "PHP");
+            assert_eq!(payload["country"], "PH");
+            assert!(payload.get("success_return_url").is_none());
+            assert!(payload.get("cancel_return_url").is_none());
+        }
+
+        let payload = build_xendit_session_payload(
+            Uuid::nil(),
+            Uuid::max(),
+            serde_json::Number::from(100),
+            "GCASH",
+            "Community campaign",
+            "https://fundora.example",
+        );
+        assert_eq!(
+            payload["success_return_url"],
+            "https://fundora.example/dashboard?paymentDonation=00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            payload["cancel_return_url"],
+            "https://fundora.example/campaigns/ffffffff-ffff-ffff-ffff-ffffffffffff?paymentCanceled=00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
     fn returns_successful_checkout_to_donor_dashboard() {
         let donation_id = Uuid::nil();
         let campaign_id = Uuid::max();
@@ -879,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_non_https_return_urls() {
+    fn only_builds_xendit_return_urls_for_https_origins() {
         let donation_id = Uuid::nil();
         let campaign_id = Uuid::nil();
 
@@ -888,6 +984,12 @@ mod tests {
         );
         assert!(
             build_return_url("http://fundora.example", campaign_id, donation_id, false).is_none()
+        );
+        assert_eq!(
+            build_return_url("https://fundora.example", campaign_id, donation_id, false).as_deref(),
+            Some(
+                "https://fundora.example/dashboard?paymentDonation=00000000-0000-0000-0000-000000000000"
+            )
         );
     }
 }

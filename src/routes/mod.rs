@@ -47,9 +47,14 @@ async fn auth_layer(
     let public_campaign_read = *method == axum::http::Method::GET
         && (path.ends_with("/campaigns") || path.contains("/campaigns/"))
         && !path.ends_with("/campaigns/mine")
+        && !path.contains("/organizer/")
         && !path.contains("/admin/");
+    let public_campaign_view = *method == axum::http::Method::POST
+        && path.contains("/campaigns/")
+        && path.ends_with("/views");
     if public_auth
         || public_campaign_read
+        || public_campaign_view
         || path.ends_with("/payments/config")
         || path.ends_with("/webhooks/xendit")
     {
@@ -120,9 +125,14 @@ pub fn router(s: AppState) -> Router {
         .route("/campaigns", get(campaigns::list).post(campaigns::create))
         .route("/campaigns/mine", get(campaigns::list_mine))
         .route(
+            "/organizer/campaigns/analytics",
+            get(campaigns::organizer_analytics),
+        )
+        .route(
             "/campaigns/{id}",
             get(campaigns::get).patch(campaigns::update),
         )
+        .route("/campaigns/{id}/views", post(campaigns::track_view))
         .route("/donations", post(payments::create))
         .route("/donations/my", get(donations::list_mine))
         .route("/donations/{id}", get(donations::get_mine))

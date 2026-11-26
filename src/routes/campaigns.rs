@@ -4,6 +4,9 @@ use axum::{
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::{
@@ -16,6 +19,36 @@ use crate::{
     error::AppError,
 };
 use serde_json::json;
+
+#[derive(Debug, Deserialize)]
+pub struct TrackCampaignView {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CampaignDailyStatistic {
+    pub date: String,
+    pub amount: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CampaignAnalytics {
+    pub campaign_id: Uuid,
+    pub views_count: i64,
+    pub total_donors: i64,
+    pub donations_today: Decimal,
+    pub daily_statistics: Vec<CampaignDailyStatistic>,
+}
+
+#[derive(Debug, FromRow)]
+struct CampaignAnalyticsRow {
+    campaign_id: Uuid,
+    views_count: i64,
+    total_donors: i64,
+    donations_today: Decimal,
+    date: String,
+    daily_amount: Decimal,
+}
 
 pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<Campaign>>, AppError> {
     Ok(Json(repo::list(&state.pool).await?))
@@ -44,7 +77,10 @@ pub async fn get(
                c.goal_amount, c.raised_amount, c.currency, c.network,
                c.contract_address, c.status, NULL::text AS review_feedback,
                NULL::uuid AS reviewed_by, NULL::timestamptz AS reviewed_at,
-               c.starts_at, c.ends_at, c.created_at, c.updated_at
+               c.starts_at, c.ends_at, c.created_at, c.updated_at,
+               (SELECT COUNT(DISTINCT d.donor_id)::bigint
+                FROM donations d
+                WHERE d.campaign_id = c.id AND d.status = 'confirmed') AS donor_count
         FROM campaigns c
         JOIN users u ON u.id = c.organizer_id
         WHERE c.id = $1 AND c.status IN ('published', 'active', 'completed')
@@ -55,6 +91,109 @@ pub async fn get(
     .await?
     .ok_or(AppError::NotFound)?;
     Ok(Json(campaign))
+}
+
+pub async fn track_view(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<TrackCampaignView>,
+) -> Result<axum::http::StatusCode, AppError> {
+    sqlx::query(
+        r#"
+        INSERT INTO campaign_views(campaign_id, session_id)
+        SELECT id, $2
+        FROM campaigns
+        WHERE id = $1 AND status IN ('published', 'active', 'completed')
+        ON CONFLICT (campaign_id, session_id) DO NOTHING
+        "#,
+    )
+    .bind(id)
+    .bind(body.session_id)
+    .execute(&state.pool)
+    .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+pub async fn organizer_analytics(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<CampaignAnalytics>>, AppError> {
+    if !has_role(&user, &["organizer", "administrator"]) {
+        return Err(AppError::Forbidden);
+    }
+
+    let rows = sqlx::query_as::<_, CampaignAnalyticsRow>(
+        r#"
+        WITH days AS (
+            SELECT GENERATE_SERIES(
+                CURRENT_DATE - INTERVAL '6 days',
+                CURRENT_DATE,
+                INTERVAL '1 day'
+            )::date AS day
+        )
+        SELECT c.id AS campaign_id,
+               COALESCE(views.views_count, 0)::bigint AS views_count,
+               COALESCE(donors.total_donors, 0)::bigint AS total_donors,
+               COALESCE(today.amount, 0) AS donations_today,
+               TO_CHAR(days.day, 'YYYY-MM-DD') AS date,
+               COALESCE(daily.amount, 0) AS daily_amount
+        FROM campaigns c
+        CROSS JOIN days
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS views_count
+            FROM campaign_views v
+            WHERE v.campaign_id = c.id
+        ) views ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(DISTINCT d.donor_id) AS total_donors
+            FROM donations d
+            WHERE d.campaign_id = c.id AND d.status = 'confirmed'
+        ) donors ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT SUM(d.amount) AS amount
+            FROM donations d
+            WHERE d.campaign_id = c.id
+              AND d.status = 'confirmed'
+              AND COALESCE(d.confirmed_at, d.created_at) >= CURRENT_DATE
+              AND COALESCE(d.confirmed_at, d.created_at) < CURRENT_DATE + INTERVAL '1 day'
+        ) today ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT SUM(d.amount) AS amount
+            FROM donations d
+            WHERE d.campaign_id = c.id
+              AND d.status = 'confirmed'
+              AND COALESCE(d.confirmed_at, d.created_at) >= days.day
+              AND COALESCE(d.confirmed_at, d.created_at) < days.day + INTERVAL '1 day'
+        ) daily ON TRUE
+        WHERE c.organizer_id = $1
+        ORDER BY c.created_at DESC, days.day
+        "#,
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut campaigns = Vec::<CampaignAnalytics>::new();
+    let mut indices = HashMap::<Uuid, usize>::new();
+    for row in rows {
+        let index = *indices.entry(row.campaign_id).or_insert_with(|| {
+            campaigns.push(CampaignAnalytics {
+                campaign_id: row.campaign_id,
+                views_count: row.views_count,
+                total_donors: row.total_donors,
+                donations_today: row.donations_today,
+                daily_statistics: Vec::with_capacity(7),
+            });
+            campaigns.len() - 1
+        });
+        campaigns[index]
+            .daily_statistics
+            .push(CampaignDailyStatistic {
+                date: row.date,
+                amount: row.daily_amount,
+            });
+    }
+    Ok(Json(campaigns))
 }
 
 fn validate_schedule(
@@ -241,21 +380,27 @@ pub async fn update(
         "status": &campaign.status
     });
     let mut tx = state.pool.begin().await?;
+    let current = sqlx::query_as::<_, (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+    )>(
+        "SELECT status, category, beneficiary_name, starts_at, ends_at FROM campaigns WHERE id = $1 AND organizer_id = $2 FOR UPDATE",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    if campaign_locked_for_edits(&current.0) {
+        return Err(AppError::Conflict(
+            "Published campaigns can no longer be edited.".into(),
+        ));
+    }
+
     if user.role == "organizer" {
-        let current = sqlx::query_as::<_, (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<chrono::DateTime<Utc>>,
-            Option<chrono::DateTime<Utc>>,
-        )>(
-            "SELECT status, category, beneficiary_name, starts_at, ends_at FROM campaigns WHERE id = $1 AND organizer_id = $2 FOR UPDATE",
-        )
-        .bind(id)
-        .bind(user.id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(AppError::NotFound)?;
         if let Some(status) = campaign.status.as_deref() {
             let allowed = match status {
                 "draft" => current.0 == "draft",
@@ -322,9 +467,16 @@ pub async fn update(
     Ok(Json(updated))
 }
 
+fn campaign_locked_for_edits(status: &str) -> bool {
+    matches!(
+        status,
+        "published" | "active" | "paused" | "completed" | "archived"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_php_fundraising_goal;
+    use super::{campaign_locked_for_edits, validate_php_fundraising_goal};
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
@@ -340,5 +492,15 @@ mod tests {
                 .is_err()
         );
         assert!(validate_php_fundraising_goal(Decimal::ONE, Some("ETH")).is_err());
+    }
+
+    #[test]
+    fn locks_campaign_edits_after_publication() {
+        for status in ["published", "active", "paused", "completed", "archived"] {
+            assert!(campaign_locked_for_edits(status));
+        }
+        for status in ["draft", "pending_review", "changes_requested", "rejected"] {
+            assert!(!campaign_locked_for_edits(status));
+        }
     }
 }

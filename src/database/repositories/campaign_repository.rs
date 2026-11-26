@@ -11,7 +11,10 @@ pub async fn list(pool: &PgPool) -> Result<Vec<Campaign>, sqlx::Error> {
                c.network, c.contract_address, c.status,
                NULL::text AS review_feedback, NULL::uuid AS reviewed_by,
                NULL::timestamptz AS reviewed_at, c.starts_at, c.ends_at,
-               c.created_at, c.updated_at
+               c.created_at, c.updated_at,
+               (SELECT COUNT(DISTINCT d.donor_id)::bigint
+                FROM donations d
+                WHERE d.campaign_id = c.id AND d.status = 'confirmed') AS donor_count
         FROM campaigns c
         WHERE c.status IN ('published','active','completed')
         ORDER BY c.created_at DESC
@@ -25,10 +28,20 @@ pub async fn list_for_organizer(
     pool: &PgPool,
     organizer_id: Uuid,
 ) -> Result<Vec<Campaign>, sqlx::Error> {
-    sqlx::query_as("SELECT * FROM campaigns WHERE organizer_id=$1 ORDER BY created_at DESC")
-        .bind(organizer_id)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as(
+        r#"
+        SELECT c.*,
+               (SELECT COUNT(DISTINCT d.donor_id)::bigint
+                FROM donations d
+                WHERE d.campaign_id = c.id AND d.status = 'confirmed') AS donor_count
+        FROM campaigns c
+        WHERE c.organizer_id=$1
+        ORDER BY c.created_at DESC
+        "#,
+    )
+    .bind(organizer_id)
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn create(

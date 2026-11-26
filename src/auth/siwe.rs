@@ -539,6 +539,7 @@ mod tests {
             jwt_secret: String::new(),
             jwt_issuer: String::new(),
             frontend_origin: String::new(),
+            xendit_return_origin: None,
             email_from: String::new(),
             resend_api_key: String::new(),
             google_client_id: String::new(),

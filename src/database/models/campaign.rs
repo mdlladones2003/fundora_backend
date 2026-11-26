@@ -28,6 +28,8 @@ pub struct Campaign {
     pub ends_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub donor_count: i64,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -56,6 +58,8 @@ pub struct CampaignDetails {
     pub ends_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub donor_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
